@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import json
 from http.cookies import SimpleCookie
 from typing import Any
 from unittest.mock import MagicMock
@@ -446,6 +447,136 @@ def test_auth_callback_sets_signed_cookie(monkeypatch: pytest.MonkeyPatch) -> No
         assert '"is_logged_in": true' in payload.lower()
 
 
+def _install_oauth_callback_stubs(
+    monkeypatch: pytest.MonkeyPatch, token: dict[str, Any]
+) -> None:
+    """Stub OAuth client + origin lookup for callback tests."""
+
+    class _DummyClient:
+        async def authorize_access_token(self, request: Any) -> dict[str, Any]:
+            return token
+
+    monkeypatch.setattr(
+        starlette_auth_routes,
+        "_create_oauth_client",
+        lambda provider: (_DummyClient(), "/redirect"),
+    )
+    monkeypatch.setattr(
+        starlette_auth_routes,
+        "_get_provider_by_state",
+        lambda request, state: "default",
+    )
+    monkeypatch.setattr(
+        starlette_auth_routes,
+        "_get_origin_from_secrets",
+        lambda: "http://testserver",
+    )
+
+
+def _decode_tokens_cookie(response: Any) -> dict[str, Any] | None:
+    """Decode the signed tokens cookie from a callback response, if present."""
+    set_cookie_headers = response.headers.get_list("set-cookie")
+    tokens_header = next(
+        (
+            header
+            for header in set_cookie_headers
+            if header.startswith(f"{TOKENS_COOKIE_NAME}=") and "Max-Age=0" not in header
+        ),
+        None,
+    )
+    if tokens_header is None:
+        return None
+
+    cookies = SimpleCookie()
+    cookies.load(tokens_header)
+    signed_value = cookies[TOKENS_COOKIE_NAME].value
+    decoded = starlette_app_utils.decode_signed_value(
+        "test-secret", TOKENS_COOKIE_NAME, signed_value
+    )
+    assert decoded is not None
+    return json.loads(decoded)
+
+
+@patch_config_options({"server.cookieSecret": "test-secret"})
+def test_auth_callback_stores_id_token_not_access_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Access tokens are not persisted unless expose_tokens includes access."""
+    monkeypatch.setattr(
+        "streamlit.auth_util.get_expose_tokens_config",
+        list,
+    )
+    _install_oauth_callback_stubs(
+        monkeypatch,
+        {
+            "userinfo": {"email": "user@example.com"},
+            "id_token": "id-token-value",
+            "access_token": "access-token-value",
+        },
+    )
+
+    app = Starlette(routes=create_auth_routes(""))
+    with TestClient(app) as client:
+        response = client.get("/oauth2callback?state=abc", follow_redirects=False)
+
+    payload = _decode_tokens_cookie(response)
+    assert payload == {"id_token": "id-token-value"}
+
+
+@patch_config_options({"server.cookieSecret": "test-secret"})
+def test_auth_callback_stores_access_token_when_exposed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Access tokens are stored when expose_tokens explicitly opts in."""
+    monkeypatch.setattr(
+        "streamlit.auth_util.get_expose_tokens_config",
+        lambda: ["access"],
+    )
+    _install_oauth_callback_stubs(
+        monkeypatch,
+        {
+            "userinfo": {"email": "user@example.com"},
+            "id_token": "id-token-value",
+            "access_token": "access-token-value",
+        },
+    )
+
+    app = Starlette(routes=create_auth_routes(""))
+    with TestClient(app) as client:
+        response = client.get("/oauth2callback?state=abc", follow_redirects=False)
+
+    assert _decode_tokens_cookie(response) == {
+        "id_token": "id-token-value",
+        "access_token": "access-token-value",
+    }
+
+
+@patch_config_options({"server.cookieSecret": "test-secret"})
+def test_auth_callback_clears_tokens_cookie_when_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An OAuth response with no persistable tokens clears stale token cookies."""
+    monkeypatch.setattr(
+        "streamlit.auth_util.get_expose_tokens_config",
+        list,
+    )
+    _install_oauth_callback_stubs(
+        monkeypatch,
+        {
+            "userinfo": {"email": "user@example.com"},
+            "access_token": "access-token-value",
+        },
+    )
+
+    app = Starlette(routes=create_auth_routes(""))
+    with TestClient(app) as client:
+        client.cookies.set(TOKENS_COOKIE_NAME, "stale-token-cookie")
+        response = client.get("/oauth2callback?state=abc", follow_redirects=False)
+
+    assert _has_auth_cookie_deletion(response, TOKENS_COOKIE_NAME, path="/")
+    assert _decode_tokens_cookie(response) is None
+
+
 def test_login_initializes_session(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that login endpoint initializes a session for OAuth flow."""
     captured_session: dict[str, Any] | None = None
@@ -834,6 +965,14 @@ class TestAuthCookieFlags:
             asyncio.run(
                 starlette_auth_routes._set_auth_cookie(
                     response,
+                    Request(
+                        {
+                            "type": "http",
+                            "method": "GET",
+                            "path": "/",
+                            "headers": [],
+                        }
+                    ),
                     {"email": "user@example.com"},
                     {"access_token": "token"},
                 )
@@ -861,7 +1000,10 @@ class TestAuthCookieFlags:
         """Test that auth cookie is set with correct security flags."""
 
         async def _dummy_authorize_access_token(self, request: Any) -> dict[str, Any]:
-            return {"userinfo": {"email": "user@example.com"}}
+            return {
+                "userinfo": {"email": "user@example.com"},
+                "id_token": "test-id-token",
+            }
 
         class _DummyClient:
             async def authorize_access_token(self, request: Any) -> dict[str, Any]:
