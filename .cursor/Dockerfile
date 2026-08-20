@@ -53,3 +53,6 @@ RUN useradd -m -s /bin/bash ubuntu \
 
 USER ubuntu
 WORKDIR /workspace
+
+# Enable corepack for Yarn 4 (required by frontend/package.json)
+RUN corepack enable

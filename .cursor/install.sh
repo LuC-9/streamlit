@@ -40,3 +40,22 @@ export INSTALL_PLAYWRIGHT=false
 
 make init
 make frontend-fast
+
+# Configure agent shells so make debug works without manual nvm/corepack setup.
+PROFILE_SNIPPET="$HOME/.profile_cursor_env"
+cat > "$PROFILE_SNIPPET" << 'EOF'
+export PATH="$HOME/.local/bin:$PATH"
+if [[ -s "$HOME/.nvm/nvm.sh" && -f /workspace/.nvmrc ]]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.nvm/nvm.sh"
+  NVM_VERSION=$(< /workspace/.nvmrc)
+  NVM_NODE_DIR="$HOME/.nvm/versions/node/${NVM_VERSION}"
+  if [[ -d "$NVM_NODE_DIR/bin" ]]; then
+    export PATH="$NVM_NODE_DIR/bin:$PATH"
+  fi
+fi
+corepack enable yarn >/dev/null 2>&1 || true
+EOF
+if ! grep -q 'profile_cursor_env' "$HOME/.bashrc" 2>/dev/null; then
+  echo '. "$HOME/.profile_cursor_env"' >> "$HOME/.bashrc"
+fi
