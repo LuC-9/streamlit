@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import os
 import sys
 import unittest
 import warnings
@@ -28,19 +29,20 @@ import pytest
 from streamlit import auth_util
 from streamlit.auth_util import (
     AuthCache,
-    _calculate_signing_overhead,
     _set_split_cookie,
     generate_default_provider_section,
     get_cookie_with_chunks,
     get_expose_tokens_config,
     get_redirect_uri,
     get_signing_secret,
+    get_tokens_to_store,
     is_authlib_installed,
     set_cookie_with_chunks,
     validate_auth_credentials,
 )
 from streamlit.errors import StreamlitAuthError
 from streamlit.runtime.secrets import AttrDict
+from streamlit.web.server.starlette.starlette_app_utils import create_signed_value
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -256,17 +258,76 @@ class ExposeTokensConfigTest(unittest.TestCase):
             )
 
 
+@pytest.mark.parametrize(
+    ("expose_tokens_config", "token_payload", "expected"),
+    [
+        (
+            None,
+            {"id_token": "test-id-token", "access_token": "test-access-token"},
+            {"id_token": "test-id-token"},
+        ),
+        (
+            ["access"],
+            {"id_token": "test-id-token", "access_token": "test-access-token"},
+            {"id_token": "test-id-token", "access_token": "test-access-token"},
+        ),
+        (
+            None,
+            {},
+            {},
+        ),
+        (
+            ["access"],
+            {"access_token": "test-access-token"},
+            {"access_token": "test-access-token"},
+        ),
+        (
+            ["access"],
+            {"id_token": None, "access_token": 12345},
+            {},
+        ),
+        (
+            ["id"],
+            {"id_token": "test-id-token", "access_token": "test-access-token"},
+            {"id_token": "test-id-token"},
+        ),
+    ],
+    ids=[
+        "default_keeps_only_id_token",
+        "access_exposed_keeps_both",
+        "empty_payload_returns_empty",
+        "only_access_token_in_payload",
+        "non_string_tokens_ignored",
+        "id_only_does_not_store_access",
+    ],
+)
+def test_tokens_to_store(
+    expose_tokens_config: list[str] | None,
+    token_payload: dict[str, Any],
+    expected: dict[str, str],
+) -> None:
+    """Verify tokens are stored based on expose_tokens configuration and payload."""
+    secrets_config: dict[str, Any] = {
+        "redirect_uri": "http://localhost:8501/oauth2callback",
+        "cookie_secret": "test_cookie_secret",
+    }
+    if expose_tokens_config is not None:
+        secrets_config["expose_tokens"] = expose_tokens_config
+
+    with patch(
+        "streamlit.auth_util.secrets_singleton",
+        MagicMock(
+            load_if_toml_exists=MagicMock(return_value=True),
+            get=MagicMock(return_value=secrets_config),
+        ),
+    ):
+        result = get_tokens_to_store(token_payload)
+
+    assert result == expected
+
+
 class CookieChunkingTest(unittest.TestCase):
     """Test cookie chunking functionality."""
-
-    def test_calculate_signing_overhead(self):
-        """Test that signing overhead is calculated correctly from the signing function."""
-        # The overhead should be the signed size minus base64 size of the test value
-        # base64("x") = "eA==" which is 4 bytes
-        overhead = _calculate_signing_overhead(
-            create_realistic_signed_value, "test_cookie"
-        )
-        assert overhead == MOCK_SIGNING_OVERHEAD
 
     def test_set_cookie_with_chunks_small_cookie(self):
         """Test that small cookies are set without chunking."""
@@ -492,6 +553,28 @@ class CookieChunkingTest(unittest.TestCase):
         result = get_cookie_with_chunks(mock_get_cookie, "auth_cookie")
         assert result is not None
         assert json.loads(result) == data
+
+    def test_chunked_cookies_stay_under_browser_limit(self):
+        """Each signed chunk stays within the 4096-byte browser cookie limit."""
+        cookies: dict[str, str] = {}
+
+        def mock_set_cookie(name: str, value: str) -> None:
+            cookies[name] = value
+
+        data = {"token": "x" * 5000}
+        set_cookie_with_chunks(
+            mock_set_cookie,
+            create_realistic_signed_value,
+            "auth_cookie",
+            data,
+            cookie_attr_size=TEST_COOKIE_ATTR_SIZE,
+        )
+
+        assert cookies["auth_cookie"].startswith("chunks-")
+        for name, value in cookies.items():
+            signed = create_realistic_signed_value(name, value)
+            cookie_size = len(name) + 1 + len(signed) + TEST_COOKIE_ATTR_SIZE
+            assert cookie_size <= auth_util.MAX_COOKIE_BYTES
 
 
 class GenerateDefaultProviderSectionTest(unittest.TestCase):
@@ -962,35 +1045,122 @@ def test_provider_token_raises_install_hint_when_no_jose_backend_available(
         getattr(auth_util, operation)(*args)
 
 
-def test_set_split_cookie_single_chunk_path() -> None:
-    """Cover ``_set_split_cookie`` when the serialized value fits in one chunk.
-
-    The initial signed payload can exceed ``MAX_COOKIE_BYTES`` while the
-    empirically measured signing overhead (from the minimal probe value ``x``)
-    still leaves enough room for the full serialized string in a single chunk.
-    """
+def test_set_split_cookie_raises_when_no_prefix_fits() -> None:
+    """Raise when signing overhead leaves no room for even a one-byte chunk."""
     set_calls: list[tuple[str, str]] = []
 
     def mock_set(name: str, val: str) -> None:
         set_calls.append((name, val))
 
-    large_prefix = b"P" * 4500
+    oversized_prefix = b"P" * 4500
 
     def mock_create_signed(_name: str, value: str) -> bytes:
-        if value == "x":
-            return b"sig:" + base64.b64encode(value.encode())
-        return large_prefix + base64.b64encode(value.encode())
+        return oversized_prefix + value.encode()
 
-    serialized = json.dumps({"data": "y" * 400})
-    _set_split_cookie(
-        mock_set,
-        mock_create_signed,
-        "c",
-        serialized,
+    with pytest.raises(
+        StreamlitAuthError, match="Not enough space available for the signed value"
+    ):
+        _set_split_cookie(
+            mock_set,
+            mock_create_signed,
+            "c",
+            json.dumps({"data": "y" * 400}),
+            cookie_attr_size=TEST_COOKIE_ATTR_SIZE,
+        )
+
+    assert set_calls == []
+
+
+def test_itsdangerous_chunks_stay_under_limit_and_round_trip() -> None:
+    """itsdangerous signing must not over-split a just-over-limit token cookie.
+
+    Reproduces the Authentik / #16569 failure mode: a ~4.6KB signed
+    ``_streamlit_user_tokens`` cookie used to be split into five near-limit
+    chunks (probe-overhead + 4/3 base64 math). Measuring the real signed size
+    keeps each chunk under 4096 bytes with only two pieces.
+    """
+    cookie_name = "_streamlit_user_tokens"
+    cookies: dict[str, str] = {}
+
+    def mock_set_cookie(name: str, value: str) -> None:
+        cookies[name] = value
+
+    def sign(name: str, value: str) -> bytes:
+        return create_signed_value("test-secret", name, value)
+
+    def jwt_like(length: int) -> str:
+        # High-entropy URL-safe payload, similar to real OIDC JWTs.
+        return base64.urlsafe_b64encode(os.urandom(length)).decode("ascii")
+
+    payload_size = 500
+    data: dict[str, str] = {}
+    while payload_size <= 8000:
+        data = {
+            "id_token": jwt_like(payload_size),
+            "access_token": jwt_like(payload_size),
+        }
+        serialized = json.dumps(data)
+        signed = sign(cookie_name, serialized)
+        size = len(cookie_name) + 1 + len(signed) + TEST_COOKIE_ATTR_SIZE
+        if size > auth_util.MAX_COOKIE_BYTES:
+            break
+        payload_size += 50
+    else:  # pragma: no cover - defensive
+        raise AssertionError("Could not find a just-over-limit token payload")
+
+    set_cookie_with_chunks(
+        mock_set_cookie,
+        sign,
+        cookie_name,
+        data,
         cookie_attr_size=TEST_COOKIE_ATTR_SIZE,
     )
 
-    assert set_calls == [("c", serialized)]
+    assert cookies[cookie_name].startswith("chunks-")
+    chunk_count = int(cookies[cookie_name].split("-")[1])
+    assert chunk_count == 2
+
+    for name, value in cookies.items():
+        signed = sign(name, value)
+        cookie_size = len(name) + 1 + len(signed) + TEST_COOKIE_ATTR_SIZE
+        assert cookie_size <= auth_util.MAX_COOKIE_BYTES
+
+    def mock_get_cookie(name: str) -> bytes | None:
+        stored = cookies.get(name)
+        if stored is None:
+            return None
+        return stored.encode()
+
+    reconstructed = get_cookie_with_chunks(mock_get_cookie, cookie_name)
+    assert reconstructed is not None
+    assert json.loads(reconstructed) == data
+
+
+def test_split_cookie_falls_back_to_one_byte_prefix() -> None:
+    """When overflow would skip every prefix, retry a one-byte chunk."""
+    cookies: dict[str, str] = {}
+
+    def mock_set(name: str, value: str) -> None:
+        cookies[name] = value
+
+    def mock_sign(_name: str, value: str) -> bytes:
+        if len(value) <= 1:
+            return b"small"
+        return b"x" * 5000
+
+    _set_split_cookie(
+        mock_set,
+        mock_sign,
+        "c",
+        "abcd",
+        cookie_attr_size=TEST_COOKIE_ATTR_SIZE,
+    )
+
+    assert cookies["c"] == "chunks-4"
+    assert cookies["c_1"] == "a"
+    assert cookies["c_2"] == "b"
+    assert cookies["c_3"] == "c"
+    assert cookies["c_4"] == "d"
 
 
 @pytest.mark.parametrize(

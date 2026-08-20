@@ -30,6 +30,7 @@ from streamlit.auth_util import (
     get_origin_from_redirect_uri,
     get_redirect_uri,
     get_secrets_auth_section,
+    get_tokens_to_store,
     get_validated_redirect_uri,
     set_cookie_with_chunks,
 )
@@ -162,12 +163,16 @@ def _get_cookie_path() -> str:
 
 
 async def _set_auth_cookie(
-    response: Response, user_info: dict[str, Any], tokens: dict[str, Any]
+    response: Response,
+    request: Request,
+    user_info: dict[str, Any],
+    tokens: dict[str, Any],
 ) -> None:
     """Set the auth cookies with signed user info and tokens.
 
     This cookie uses itsdangerous signing. Cookies may be split into multiple
-    chunks if they exceed browser limits.
+    chunks if they exceed browser limits. If ``tokens`` is empty, any existing
+    token cookies are cleared so stale or chunked values cannot persist.
     """
 
     def set_single_cookie(cookie_name: str, value: str) -> None:
@@ -183,13 +188,16 @@ async def _set_auth_cookie(
         user_info,
         cookie_attr_size=cookie_attr_size,
     )
-    set_cookie_with_chunks(
-        set_single_cookie,
-        _create_signed_value_wrapper,
-        TOKENS_COOKIE_NAME,
-        tokens,
-        cookie_attr_size=cookie_attr_size,
-    )
+    if tokens:
+        set_cookie_with_chunks(
+            set_single_cookie,
+            _create_signed_value_wrapper,
+            TOKENS_COOKIE_NAME,
+            tokens,
+            cookie_attr_size=cookie_attr_size,
+        )
+    else:
+        _clear_single_auth_cookie_and_chunks(response, request, TOKENS_COOKIE_NAME)
 
 
 def _get_auth_cookie_attribute_size() -> int:
@@ -614,9 +622,9 @@ async def _auth_callback(request: Request, base_url: str) -> Response:
     response = await _redirect_to_base_clearing_invalid_cookies(request, base_url)
 
     cookie_value = dict(user, origin=origin, is_logged_in=True, provider=provider)
-    tokens = {k: token[k] for k in ["id_token", "access_token"] if k in token}
+    tokens = get_tokens_to_store(token)
     if user:
-        await _set_auth_cookie(response, cookie_value, tokens)
+        await _set_auth_cookie(response, request, cookie_value, tokens)
     else:  # pragma: no cover - error path
         _LOGGER.error(
             "OAuth provider '%s' did not return user information during callback.",
